@@ -8,13 +8,14 @@
 
 1. 接口结构优先满足 Agent 闭环：`Observe → Plan → Act → Verify → Respond`。
 2. MVP 首选 Built-in Mock Service；本文件中的 HTTP API 可作为本地 Mock API Server 或后续真实接口的契约。
-3. Mock API 与真实 API 尽量保持相同请求和响应结构。
+3. Mock API 与真实 API 尽量保持相同请求和响应结构，但敏感工具的执行凭证只允许在 Orchestrator / Safety Gate / Tool Adapter 内部流转。
 4. 所有接口返回统一响应格式，便于前端、Agent 和 Tool Safety Gate 处理错误。
 5. 涉及个人数据的接口必须要求演示账号或登录态授权。
 6. 敏感操作接口不接受大模型直接调用，只能由工具层在 PendingAction 确认后调用。
 7. 所有响应、日志、Trace 必须脱敏，不返回完整学号、完整校园卡号、Token 或密钥。
 8. 需要用户确认的 Agent Run 必须先暂停为 `suspended_for_confirmation`，再通过 `resume` 继续执行；不得在同一条单向流中伪造用户确认。
 9. 知识库 `score` 仅表示检索相关性，不表示答案真实性概率。
+10. `confirmationId` 是内部一次性执行凭证，不返回给客户端，不要求客户端保存，也不允许客户端提交。
 
 ## 2. 通用约定
 
@@ -22,7 +23,7 @@
 
 | 环境 | Base URL | 说明 | MVP |
 | --- | --- | --- | --- |
-| Built-in Mock Service | 内部 Repository 调用 | Chrome Web 主演示路径，无需后端服务 | P0 |
+| Built-in Mock Service | 内部 Repository 调用 | Chrome Web 主演示路径，无需后端服务 | P0A |
 | 本地 Mock API | `http://127.0.0.1:8787/api/v1` | 可选工程展示 | P1 |
 | 局域网 Mock API | `http://<host-ip>:8787/api/v1` | Android 真机调试可选 | P1 |
 | 生产环境 | 待定 | 后续对接学校真实服务 | P2 |
@@ -288,7 +289,7 @@ POST /agent/runs/{runId}/resume
   "data": {
     "runId": "run_20260707_001",
     "status": "resumed",
-    "confirmationId": "confirm_20260707_001"
+    "resumedAt": "2026-07-07T10:05:00+08:00"
   }
 }
 ```
@@ -296,9 +297,10 @@ POST /agent/runs/{runId}/resume
 规则：
 
 1. `resume` 只能用于 `suspended_for_confirmation` 状态的 Run。
-2. `resume` 必须校验 PendingAction 状态、过期时间和 `frozenParamsHash`，校验通过后内部签发一次性 `confirmationId`。
+2. `resume` 必须校验 PendingAction 状态、过期时间和 `frozenParamsHash`，校验通过后在 Orchestrator 内部签发一次性 `confirmationId`。
 3. `resume` 后只能执行原计划中被冻结的后半段，不得重新让模型改写敏感工具参数。
 4. `resume` 失败时不得执行敏感工具。
+5. `confirmationId` 不进入 HTTP 响应体、前端状态、Debug Trace 或日志，只能作为内部执行上下文传给 Safety Gate / Tool Adapter。
 
 ## 6. 校园卡接口
 
@@ -336,9 +338,11 @@ GET /campus-card/status
 | `frozen` | 冻结。 |
 | `unknown` | 状态未知。 |
 
-### 6.2 挂失校园卡
+### 6.2 挂失校园卡（内部 Tool Adapter）
 
 工具名：`campus_card.report_loss`
+
+该能力只能由 Agent Orchestrator 在 `resume(runId, pendingActionId)` 成功后触发。Flutter UI、模型输出和外部调用方不得直接请求该接口。若使用本地 Mock API Server 展示接口分层，`POST /campus-card/report-loss` 也必须只接受来自 Tool Adapter 的服务端内部调用。
 
 ```http
 POST /campus-card/report-loss
@@ -350,12 +354,11 @@ POST /campus-card/report-loss
 {
   "reason": "lost",
   "pendingActionId": "pa_20260707_001",
-  "confirmationId": "confirm_20260707_001",
   "frozenParamsHash": "sha256:8c7d-demo-hash"
 }
 ```
 
-工具层必须重新计算规范化执行参数哈希，并与 `frozenParamsHash` 比对。比对失败时返回 `PENDING_ACTION_INVALID` 或 `SAFETY_GATE_BLOCKED`，不得执行挂失。
+内部执行上下文必须包含 Orchestrator 签发的一次性 `confirmationId`，但该值不出现在客户端请求、公开接口示例、Trace 或日志中。工具层必须重新计算规范化执行参数哈希，并与 `frozenParamsHash` 比对；Safety Gate 同时校验内部 `confirmationId`、PendingAction 状态和幂等记录。任一校验失败时返回 `PENDING_ACTION_INVALID` 或 `SAFETY_GATE_BLOCKED`，不得执行挂失。
 
 响应：
 
@@ -384,7 +387,7 @@ POST /campus-card/report-loss
 | --- | --- | --- |
 | `CARD_ALREADY_LOST` | 校园卡已挂失。 | 展示当前状态和补办指引。 |
 | `CARD_NOT_FOUND` | 未找到绑定校园卡。 | 引导绑定身份或联系人工服务。 |
-| `CONFIRMATION_REQUIRED` | 未携带确认凭证。 | 展示 PendingAction 确认流程。 |
+| `CONFIRMATION_REQUIRED` | 未通过 `resume` 确认或内部执行上下文缺失。 | 展示 PendingAction 确认流程。 |
 | `PENDING_ACTION_EXPIRED` | 确认已过期。 | 重新发起挂失流程。 |
 | `PENDING_ACTION_INVALID` | 参数与冻结参数不一致。 | 阻断执行，提示重新确认。 |
 | `CARD_SERVICE_UNAVAILABLE` | 校园卡服务不可用。 | 提供重试和人工办理路径。 |
@@ -430,7 +433,7 @@ POST /knowledge/search
         "score": 0.91
       }
     ],
-    "confidencePolicy": {
+    "relevancePolicy": {
       "directAnswerThreshold": 0.80,
       "caveatThreshold": 0.65
     }
@@ -505,7 +508,7 @@ MVP 阶段课表优先存储在本地，因此以下接口作为本地 Repositor
 
 ### 8.2 新增/编辑/删除课程 P1
 
-`schedule.create`、`schedule.update`、`schedule.delete` 为 P1，不作为 MVP P0 阻塞项。删除课程等破坏性本地操作应复用 PendingAction 或提供撤销。
+`schedule.create`、`schedule.update`、`schedule.delete` 为 P1，不作为 MVP P0A 阻塞项。删除课程等破坏性本地操作应复用 PendingAction 或提供撤销。
 
 ## 9. Agent 会话接口
 
@@ -677,8 +680,8 @@ POST /events
 ## 11. 接口验收标准
 
 1. 所有接口成功和失败都使用统一响应格式。
-2. P0 工具协议覆盖 `schedule.query`、`campus_card.get_status`、`campus_card.report_loss`、`knowledge.search`。
-3. 校园卡挂失接口必须校验 `pendingActionId`、`confirmationId` 与 `frozenParamsHash`。
+2. P0A 工具协议覆盖 `schedule.query`、`campus_card.get_status`、`campus_card.report_loss`、`knowledge.search`。
+3. 校园卡挂失接口必须校验 `pendingActionId`、内部 `confirmationId` 与 `frozenParamsHash`；客户端不得持有或提交 `confirmationId`。
 4. Mock 数据能覆盖校园卡挂失、课表查询、图书馆时间、补办流程。
 5. 前端能根据错误码展示明确错误提示。
 6. RAG 响应必须包含 `knowledgeId`、`source`、`updatedAt`、`trustLevel`、`score`，并说明 `score` 是相关性分数。
