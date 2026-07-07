@@ -1,9 +1,9 @@
 # Campus Agent 软件需求规格说明书 SRS
 
-版本：V1.1  
+版本：V1.2  
 关联文档：[PRD.md](./PRD.md)  
 适用阶段：需求分析、概要设计、测试验收、竞赛答辩  
-项目形态：Flutter 应用；竞赛首选 Chrome Web + 内置 Mock Service，Android APK 作为备选交付形态
+项目形态：Flutter 应用；Chrome Web + 内置 Mock Service 作为稳定演示路径，Android APK 作为移动端交付证据
 
 ## 1. 引言
 
@@ -15,17 +15,21 @@
 
 Campus Agent 是面向中南民族大学在校学生与教职工的事务型校园 AI Agent。系统通过文本接收用户指令，结合大模型/规则编排、本地课表、校园知识库和内置 Mock Service，完成校园事务查询、校园卡挂失、课表查询和知识问答等任务。
 
-MVP 阶段只承诺以下 P0 能力：
+MVP 阶段采用 P0A/P0B 分级交付。
 
-- 文本聊天交互：文本输入、流式回复或状态提示、停止/重试、工具调用状态展示。
-- Agent 闭环：所有核心请求遵循 `Observe → Plan → Act → Verify → Respond`。
-- Tool Safety Gate：模型只能提出计划，工具调用必须经过白名单、Schema、权限、敏感等级和确认检查。
-- PendingAction：校园卡挂失等敏感操作必须先创建待确认动作，确认后才允许执行。
+P0A 必须交付：
+
+- 文本聊天交互：文本输入、阶段状态提示、停止/重试、工具调用状态展示。
+- Agent Run 状态机：核心请求遵循 `Observe → Plan → Act → Verify → Respond`，并支持 `suspended_for_confirmation` 与 `resume`。
+- Tool Safety Gate：模型只能提出计划，工具调用必须经过白名单、Schema、权限、敏感等级、确认凭证和冻结参数哈希检查。
+- PendingAction：校园卡挂失等敏感操作必须先创建待确认动作，确认后通过 `resume` 执行后半段。
 - 核心工具：`schedule.query`、`campus_card.get_status`、`campus_card.report_loss`、`knowledge.search`。
 - 本地课表查询：使用预置或本地课表数据支持自然语言查课与离线查看。
-- 校园知识问答：基于知识库检索结果回答，展示来源、更新时间、可信等级和置信度。
-- 失败兜底：网络、工具、模型、确认、低置信 RAG 等失败状态均有明确用户路径。
-- 评委 Trace：Demo 模式下展示脱敏的阶段级执行轨迹。
+- 校园知识问答：基于知识库检索结果回答，展示来源、更新时间、可信等级和相关性分数。
+- 失败兜底：网络、工具、模型、确认、低相关 RAG 等失败状态均有明确用户路径。
+- Judge Mode / Debug Trace：Demo 模式下展示脱敏的阶段级执行轨迹。
+
+P0B 在 P0A 稳定后交付：大模型流式自然语言摘要、低相关安全失败 Demo、Android APK 完整演示证据、Judge Mode 微交互增强。
 
 以下能力不属于 MVP P0：语音输入、完整课表新增/编辑/删除、真实校园 API、真实统一认证、通知摘要、TTS、图书馆馆藏检索、iOS、生产级埋点。
 
@@ -35,11 +39,13 @@ MVP 阶段只承诺以下 P0 能力：
 | --- | --- |
 | Agent | 能将用户自然语言目标转化为可观察、可确认、可验证事务流程的编排模块。 |
 | Agent 闭环 | `Observe → Plan → Act → Verify → Respond`，用于证明系统不是普通聊天机器人。 |
+| Agent Run | 一次用户请求对应的可追踪执行实例，包含 `runId`、状态机、阶段事件、工具调用和最终结果。 |
 | Tool | Agent 可调用的受控功能单元，例如查询课表、查询校园卡状态、挂失校园卡、检索知识库。 |
 | Tool Safety Gate | 位于 Plan 与 Act 之间的强制安全门，负责工具白名单、参数校验、权限、确认和日志脱敏。 |
-| PendingAction | 敏感操作在执行前创建的待确认动作，包含冻结参数、风险说明、过期时间和一次性确认凭证。 |
-| RAG | 检索增强生成，通过校园知识库检索结果约束大模型回答。 |
+| PendingAction | 敏感操作在执行前创建的待确认动作，包含冻结参数摘要、规范化参数哈希、风险说明、过期时间和一次性确认凭证。 |
+| RAG | 检索增强生成，通过校园知识库检索结果约束大模型回答；MVP 的 `score` 仅表示检索相关性，不表示真实性概率。 |
 | Debug Trace | Demo 模式下展示的脱敏阶段级执行轨迹，不包含隐藏推理链、密钥或敏感明文。 |
+| Judge Mode | 面向评委的演示模式，以聊天 + Agent 飞行记录仪展示阶段、工具、安全门、证据和耗时。 |
 | Built-in Mock Service | 内置在 Flutter 应用中的 Mock Repository，用于竞赛稳定演示。 |
 
 ## 2. 总体描述
@@ -71,8 +77,8 @@ MVP 阶段只承诺以下 P0 能力：
 3. 大模型或规则 Agent 只能输出结构化计划，不得直接执行敏感工具。
 4. `campus_card.report_loss` 必须经过 Tool Safety Gate 与 PendingAction 确认。
 5. 用户课表数据 MVP 可使用预置数据和本地存储；完整 CRUD 移至 P1。
-6. 校园知识库内容必须标注来源、更新时间、可信等级和置信度。
-7. Debug Trace 只能展示阶段级、脱敏信息，不能展示隐藏推理链或密钥。
+6. 校园知识库内容必须标注来源、更新时间、可信等级和相关性分数。
+7. Debug Trace 只能展示 Orchestrator 产生的阶段级、脱敏信息，不能展示隐藏推理链或密钥；UI 不得自行合成 Trace。
 
 ## 3. 功能需求
 
@@ -98,18 +104,26 @@ MVP 阶段只承诺以下 P0 能力：
 | 项目 | 说明 |
 | --- | --- |
 | 优先级 | P0 |
-| 描述 | Agent 对核心请求必须遵循 `Observe → Plan → Act → Verify → Respond`。 |
-| 输入 | 用户消息、会话摘要、用户状态、工具注册表、本地数据摘要。 |
-| 输出 | 阶段状态、结构化计划、工具调用结果、验证结果、最终回复。 |
-| 验收标准 | 饭卡挂失、课表查询、图书馆时间三条核心 Demo 均可展示闭环阶段。 |
+| 描述 | Agent 对核心请求必须以 Agent Run 状态机执行，遵循 `Observe → Plan → Act → Verify → Respond`。 |
+| 输入 | `runId`、用户消息、会话摘要、用户状态、工具注册表、本地数据摘要。 |
+| 输出 | Run 状态、阶段事件、结构化计划、工具调用结果、验证结果、最终回复。 |
+| 验收标准 | 饭卡挂失、课表查询、图书馆时间三条核心 Demo 均可展示由 Orchestrator 产生的闭环阶段。 |
 
 阶段规则：
 
 1. Observe：读取用户目标、上下文、当前日期、Demo 模式和必要本地状态。
 2. Plan：识别意图、抽取参数、选择工具、判断是否需要澄清或确认。
 3. Act：只在 Tool Safety Gate 允许后执行工具。
-4. Verify：校验工具结果、业务状态、RAG 来源与置信度。
+4. Verify：校验工具结果、业务状态、RAG 来源、可信等级与相关性分数。
 5. Respond：基于已验证结果输出用户可读答复，不得编造工具未返回的信息。
+
+Run 状态规则：
+
+1. 每次用户请求创建唯一 `runId`，所有 Trace、工具调用和消息增量必须关联该 `runId`。
+2. 需要用户确认时，Run 进入 `suspended_for_confirmation`，不得继续执行敏感工具。
+3. 用户确认后通过 `resume(runId, pendingActionId)` 继续执行后半段；不得在同一条单向 SSE 中假装接收用户确认。
+4. UI 只能订阅 Run 事件并渲染，不得自行创建 `plan`、`act`、`verify` 等阶段事件。
+5. Run 终态只能是 `completed`、`failed`、`cancelled` 或 `expired`。
 
 ### 3.3 FR-003 Agent 意图识别与工具选择
 
@@ -127,7 +141,7 @@ MVP 阶段只承诺以下 P0 能力：
 2. 若模型输出不存在的工具名，Tool Safety Gate 必须阻断。
 3. 若参数缺失或 Schema 校验失败，Agent 应追问或提示修正。
 4. 对本地课表问题，应优先调用 `schedule.query`，不将完整课表发送给模型。
-5. 对校园知识问题，应优先调用 `knowledge.search`，并在 Verify 阶段执行置信度策略。
+5. 对校园知识问题，应优先调用 `knowledge.search`，并在 Verify 阶段执行相关性分数策略。
 6. 对敏感操作，Agent 只能创建 PendingAction，不能直接执行工具。
 
 ### 3.4 FR-004 工具调用状态与事务时间线
@@ -164,7 +178,7 @@ MVP 阶段只承诺以下 P0 能力：
 4. 是否满足登录、授权或演示账号要求。
 5. 是否属于敏感操作。
 6. 敏感操作是否存在有效 PendingAction 和 confirmationId。
-7. 参数是否与 PendingAction 冻结参数一致。
+7. 参数规范化 JSON 的哈希是否与 PendingAction 冻结参数哈希一致。
 8. 是否满足幂等、限流和业务前置条件。
 9. 日志与 Trace 是否已脱敏。
 
@@ -181,11 +195,12 @@ MVP 阶段只承诺以下 P0 能力：
 业务规则：
 
 1. PendingAction 创建后状态为 `pending_confirmation`。
-2. PendingAction 必须包含 `pendingActionId`、`toolName`、`frozenParamsSummary`、`riskLevel`、`warningText`、`expiresAt`、`status`。
+2. PendingAction 必须包含 `pendingActionId`、`toolName`、`frozenParamsSummary`、`frozenParamsHash`、`riskLevel`、`warningText`、`expiresAt`、`status`。
 3. 用户确认时只提交 `pendingActionId`，Agent 校验通过后签发一次性 `confirmationId`。
 4. 确认后必须使用冻结参数执行，不能重新让模型解释用户确认文本。
 5. PendingAction 取消、过期、已执行后不得再次使用。
 6. 所有结果必须可追溯到对应 `pendingActionId` 和 `toolCallId`。
+7. `frozenParamsSummary` 仅用于 UI 展示，不作为安全校验依据；安全校验必须使用规范化参数和 `frozenParamsHash`。
 
 ### 3.7 FR-007 校园卡挂失
 
@@ -228,7 +243,7 @@ MVP 阶段只承诺以下 P0 能力：
 | 优先级 | P0 |
 | 描述 | 回答校园地点、办事流程、图书馆时间、校园卡补办等问题。 |
 | 输入 | 用户问题、知识库检索条件。 |
-| 输出 | 答案、来源、更新时间、可信等级、置信度、补充建议。 |
+| 输出 | 答案、来源、更新时间、可信等级、相关性分数、补充建议。 |
 | 验收标准 | 回答应包含明确结论和来源；无法确认时说明不确定性并给出人工查询入口。 |
 
 RAG 规则：
@@ -285,14 +300,24 @@ RAG 规则：
 | Mock 服务异常 | “演示数据暂不可用。” | 重试/切换本地预置 |
 | 业务冲突 | “校园卡已处于挂失状态。” | 查看补办流程 |
 | 模型超时 | “AI 摘要超时，已保留工具结果。” | 重试摘要 |
-| RAG 低置信 | “未找到可靠来源，不能保证准确。” | 官方查询入口 |
+| RAG 低相关 | “未找到可靠来源，不能保证准确。” | 官方查询入口 |
 | 课表为空 | “当前没有课表数据。” | 使用演示课表/添加课程 |
 | 本地数据损坏 | “本地数据异常，已尝试恢复。” | 重置/重新导入 |
 
+等待阶梯要求：
+
+| 时间 | 系统行为 |
+| --- | --- |
+| 0-500ms | 插入用户消息并展示 Observe 或已收到状态。 |
+| 500ms-2s | 展示 Plan 或工具准备状态。 |
+| 2-8s | 展示具体工具 running 卡片、耗时和取消入口。 |
+| 8-15s | 提供继续等待、取消、重试可重试步骤。 |
+| 超过 15s | 进入超时兜底，保留已完成工具结果，不无限 loading。 |
+
 ### 4.4 兼容性需求
 
-1. Chrome Web 为竞赛主演示平台。
-2. Android APK 为备用交付形态。
+1. Chrome Web 为竞赛稳定演示平台。
+2. Android APK 为移动端交付证据，至少需要完整跑通一次饭卡挂失闭环并保留截图或录屏。
 3. Windows Desktop 和 iOS 不作为 MVP 强制验收项。
 4. 适配常见屏幕宽度，避免输入框、按钮、时间线、确认卡内容溢出。
 
@@ -303,13 +328,14 @@ RAG 规则：
 | 实体 | 关键字段 |
 | --- | --- |
 | UserProfile | userId、name、role、studentNoMasked、department、authStatus。 |
+| AgentRun | runId、sessionId、status、currentPhase、createdAt、suspendedAt、resumedAt、completedAt、terminalReason。 |
 | Course | courseId、name、teacher、location、weekday、startSection、endSection、weeks、remark。 |
 | ChatMessage | messageId、role、content、createdAt、relatedToolCallId。 |
 | ToolCall | toolCallId、toolName、status、inputSummary、resultSummary、createdAt、durationMs、errorCode、pendingActionId。 |
-| PendingAction | pendingActionId、toolName、frozenParamsSummary、riskLevel、warningText、expiresAt、status、confirmationId、createdAt、executedAt。 |
+| PendingAction | pendingActionId、toolName、frozenParamsSummary、frozenParamsHash、riskLevel、warningText、expiresAt、status、confirmationId、createdAt、executedAt。 |
 | CampusKnowledge | knowledgeId、title、category、content、source、updatedAt、trustLevel、score、snippet。 |
 | CampusCard | cardIdMasked、status、balance、lastUpdatedAt。 |
-| DebugTraceEvent | traceId、phase、intent、toolName、safetyDecision、evidenceIds、durationMs、redactedErrorCode、createdAt。 |
+| DebugTraceEvent | traceId、runId、sequence、phase、intent、toolName、safetyDecision、stateBefore、stateAfter、evidenceIds、durationMs、redactedErrorCode、createdAt。 |
 
 ### 5.2 数据保留策略
 
@@ -325,15 +351,16 @@ RAG 规则：
 
 | 编号 | 场景 | 通过标准 |
 | --- | --- | --- |
-| AC-001 | 用户输入“饭卡丢了，帮我挂失” | 系统展示计划，查询卡状态，创建 PendingAction；未确认前不执行挂失。 |
-| AC-002 | 用户确认挂失 | 系统调用 `campus_card.report_loss`，随后 Verify 卡状态为 `lost`。 |
+| AC-001 | 用户输入“饭卡丢了，帮我挂失” | 系统创建 Agent Run，展示计划，查询卡状态，创建 PendingAction；Run 进入 `suspended_for_confirmation`，未确认前不执行挂失。 |
+| AC-002 | 用户确认挂失 | 系统通过 `resume` 继续原 Run，调用 `campus_card.report_loss`，随后 Verify 卡状态为 `lost`。 |
 | AC-003 | 用户取消或确认过期 | 系统明确说明未执行，Mock 卡状态不变。 |
 | AC-004 | 用户输入“那怎么补办？” | 系统继承饭卡上下文，调用 `knowledge.search` 返回补办流程和来源。 |
 | AC-005 | 用户输入“我明天上午有课吗” | 系统调用 `schedule.query`，返回课程列表或无课说明。 |
 | AC-006 | 用户输入“图书馆今天几点关门” | 系统调用 `knowledge.search`，按 RAG 阈值返回答案或拒答。 |
-| AC-007 | RAG 低置信或无命中 | 系统不编造，给出官方/人工查询建议。 |
+| AC-007 | RAG 低相关或无命中 | 系统不编造，给出官方/人工查询建议。 |
 | AC-008 | 工具调用失败 | 展示失败原因、重试或人工路径，应用不崩溃。 |
 | AC-009 | Debug Trace 开启 | 可见阶段级 Trace，且无完整学号、卡号、Token、隐藏推理链。 |
+| AC-010 | UI Trace 真实性 | Trace 事件均包含 `runId` 和递增 `sequence`，由 Orchestrator 产生，UI 不能自行伪造。 |
 
 ### 6.2 竞赛演示验收
 
@@ -343,11 +370,12 @@ RAG 规则：
 4. 饭卡挂失必须展示“查状态 → 确认 → 执行 → 验证 → 补办来源”。
 5. 每次工具调用都能看到状态变化，而不是只有最终文本答案。
 6. 评委能清楚看到应用具备 Agent 的“观察、计划、安全门、执行、验证、反馈”闭环。
+7. Android APK 至少完成一次核心闭环验证，并将截图或录屏作为答辩材料。
 
 ### 6.3 通过标准
 
-1. 所有 P0 用例通过。
-2. P1 用例不阻塞 MVP 验收。
+1. 所有 P0A 用例通过。
+2. P0B 用例在 P0A 稳定后尽量完成，P1 用例不阻塞 MVP 验收。
 3. 核心演示连续执行 3 次均成功。
 4. 敏感操作未确认前不发生真实或模拟执行。
 5. 应用在核心流程中无崩溃、无明显卡死、无敏感信息明文日志。

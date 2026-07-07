@@ -1,6 +1,6 @@
 # Campus Agent API 接口设计文档
 
-版本：V1.1  
+版本：V1.2  
 适用范围：Flutter 客户端、Agent Orchestrator、Tool Safety Gate、Built-in Mock Service、本地 Mock API Server、后续真实校园 API 对接  
 关联文档：[系统架构设计.md](./系统架构设计.md)、[AI_Agent设计文档.md](./AI_Agent设计文档.md)
 
@@ -13,6 +13,8 @@
 5. 涉及个人数据的接口必须要求演示账号或登录态授权。
 6. 敏感操作接口不接受大模型直接调用，只能由工具层在 PendingAction 确认后调用。
 7. 所有响应、日志、Trace 必须脱敏，不返回完整学号、完整校园卡号、Token 或密钥。
+8. 需要用户确认的 Agent Run 必须先暂停为 `suspended_for_confirmation`，再通过 `resume` 继续执行；不得在同一条单向流中伪造用户确认。
+9. 知识库 `score` 仅表示检索相关性，不表示答案真实性概率。
 
 ## 2. 通用约定
 
@@ -81,7 +83,7 @@ X-Demo-Mode: true|false
 | `PENDING_ACTION_EXPIRED` | 409 | PendingAction 已过期 | 要求重新发起。 |
 | `PENDING_ACTION_INVALID` | 409 | PendingAction 无效或参数不一致 | 阻断执行。 |
 | `SAFETY_GATE_BLOCKED` | 403 | 安全策略阻断 | 展示安全兜底。 |
-| `LOW_CONFIDENCE_KNOWLEDGE` | 200 | 知识库低置信，不应生成具体答案 | 展示不确定和人工入口。 |
+| `LOW_RELEVANCE_KNOWLEDGE` | 200 | 知识库低相关，不应生成具体答案 | 展示不确定和人工入口。 |
 | `INTERNAL_ERROR` | 500 | 服务内部异常 | 重试或人工路径。 |
 | `SERVICE_UNAVAILABLE` | 503 | 校园服务或 Mock 服务暂不可用 | 重试/稍后/人工路径。 |
 
@@ -148,12 +150,15 @@ POST /agent/pending-actions
 
 ```json
 {
+  "runId": "run_20260707_001",
   "toolName": "campus_card.report_loss",
   "riskLevel": "high",
   "frozenParamsSummary": {
     "reason": "lost",
     "cardIdMasked": "****0188"
   },
+  "frozenParamsCanonicalJson": "{\"reason\":\"lost\",\"target\":\"current_user_card\"}",
+  "frozenParamsHash": "sha256:8c7d-demo-hash",
   "warningText": "挂失后校园卡消费、门禁或相关服务可能受限。",
   "expiresInSeconds": 300
 }
@@ -168,12 +173,14 @@ POST /agent/pending-actions
   "message": "success",
   "data": {
     "pendingActionId": "pa_20260707_001",
+    "runId": "run_20260707_001",
     "toolName": "campus_card.report_loss",
     "riskLevel": "high",
     "frozenParamsSummary": {
       "reason": "lost",
       "cardIdMasked": "****0188"
     },
+    "frozenParamsHash": "sha256:8c7d-demo-hash",
     "warningText": "挂失后校园卡消费、门禁或相关服务可能受限。",
     "expiresAt": "2026-07-07T10:10:00+08:00",
     "status": "pending_confirmation"
@@ -205,8 +212,9 @@ POST /agent/pending-actions/{pendingActionId}/confirm
 规则：
 
 1. `confirmationId` 一次性使用。
-2. `confirmationId` 仅对同一 `pendingActionId`、同一 `toolName`、同一冻结参数有效。
+2. `confirmationId` 仅对同一 `pendingActionId`、同一 `toolName`、同一 `frozenParamsHash` 有效。
 3. 过期、取消、已执行的 PendingAction 不得确认。
+4. `frozenParamsSummary` 只用于 UI 展示，Safety Gate 必须使用规范化参数哈希校验。
 
 ### 4.3 取消 PendingAction
 
@@ -228,9 +236,84 @@ POST /agent/pending-actions/{pendingActionId}/cancel
 }
 ```
 
-## 5. 校园卡接口
+## 5. Agent Run 暂停与恢复协议
 
-### 5.1 查询校园卡状态
+本协议既可作为 Flutter 内部 Orchestrator DTO，也可作为服务端 Agent Gateway 接口。P0A 即使不做后端，也必须按该状态机实现内部事件流，避免 UI 假装执行 Agent 阶段。
+
+### 5.1 Run 状态枚举
+
+| status | 说明 |
+| --- | --- |
+| `created` | 已创建但尚未执行。 |
+| `running` | 正在执行 Observe/Plan/Act/Verify/Respond。 |
+| `suspended_for_confirmation` | 等待用户确认，敏感工具尚未执行。 |
+| `resumed` | 用户确认后继续执行后半段。 |
+| `completed` | 正常完成。 |
+| `failed` | 执行失败。 |
+| `cancelled` | 用户取消。 |
+| `expired` | PendingAction 或 Run 超时。 |
+
+### 5.2 创建/发送消息
+
+```http
+POST /agent/runs
+```
+
+请求字段与 `POST /agent/messages` 保持一致。响应必须返回 `runId`。
+
+```json
+{
+  "success": true,
+  "code": "OK",
+  "message": "success",
+  "data": {
+    "runId": "run_20260707_001",
+    "status": "suspended_for_confirmation",
+    "currentPhase": "respond",
+    "pendingActionId": "pa_20260707_001"
+  }
+}
+```
+
+### 5.3 确认并恢复 Run
+
+```http
+POST /agent/runs/{runId}/resume
+```
+
+请求：
+
+```json
+{
+  "pendingActionId": "pa_20260707_001"
+}
+```
+
+响应：
+
+```json
+{
+  "success": true,
+  "code": "OK",
+  "message": "resumed",
+  "data": {
+    "runId": "run_20260707_001",
+    "status": "resumed",
+    "confirmationId": "confirm_20260707_001"
+  }
+}
+```
+
+规则：
+
+1. `resume` 只能用于 `suspended_for_confirmation` 状态的 Run。
+2. `resume` 必须校验 PendingAction 状态、过期时间、`frozenParamsHash` 和一次性确认凭证。
+3. `resume` 后只能执行原计划中被冻结的后半段，不得重新让模型改写敏感工具参数。
+4. `resume` 失败时不得执行敏感工具。
+
+## 6. 校园卡接口
+
+### 6.1 查询校园卡状态
 
 工具名：`campus_card.get_status`
 
@@ -264,7 +347,7 @@ GET /campus-card/status
 | `frozen` | 冻结。 |
 | `unknown` | 状态未知。 |
 
-### 5.2 挂失校园卡
+### 6.2 挂失校园卡
 
 工具名：`campus_card.report_loss`
 
@@ -278,9 +361,12 @@ POST /campus-card/report-loss
 {
   "reason": "lost",
   "pendingActionId": "pa_20260707_001",
-  "confirmationId": "confirm_20260707_001"
+  "confirmationId": "confirm_20260707_001",
+  "frozenParamsHash": "sha256:8c7d-demo-hash"
 }
 ```
+
+工具层必须重新计算规范化执行参数哈希，并与 `frozenParamsHash` 比对。比对失败时返回 `PENDING_ACTION_INVALID` 或 `SAFETY_GATE_BLOCKED`，不得执行挂失。
 
 响应：
 
@@ -314,9 +400,9 @@ POST /campus-card/report-loss
 | `PENDING_ACTION_INVALID` | 参数与冻结参数不一致。 | 阻断执行，提示重新确认。 |
 | `CARD_SERVICE_UNAVAILABLE` | 校园卡服务不可用。 | 提供重试和人工办理路径。 |
 
-## 6. 校园知识库接口
+## 7. 校园知识库接口
 
-### 6.1 知识库搜索
+### 7.1 知识库搜索
 
 工具名：`knowledge.search`
 
@@ -365,18 +451,20 @@ POST /knowledge/search
 
 RAG 处理规则：
 
+`score` 仅表示检索相关性。MVP 可采用关键词命中、标签权重或简化 BM25 计算，不得将其表述为“答案真实概率”。
+
 | 分数 | API/Agent 处理 |
 | ---: | --- |
 | `score >= 0.80` | 可直接回答，必须展示来源、更新时间、可信等级。 |
 | `0.65 <= score < 0.80` | 可回答但必须加不确定提示。 |
-| `score < 0.65` 或无命中 | 返回低置信状态，不生成具体结论。 |
+| `score < 0.65` 或无命中 | 返回低相关状态，不生成具体结论。 |
 
-低置信响应示例：
+低相关响应示例：
 
 ```json
 {
   "success": true,
-  "code": "LOW_CONFIDENCE_KNOWLEDGE",
+  "code": "LOW_RELEVANCE_KNOWLEDGE",
   "message": "未找到可靠知识库来源",
   "data": {
     "items": [],
@@ -385,11 +473,11 @@ RAG 处理规则：
 }
 ```
 
-## 7. 课表接口与本地工具协议
+## 8. 课表接口与本地工具协议
 
 MVP 阶段课表优先存储在本地，因此以下接口作为本地 Repository 的方法协议，也可在后续迁移到服务端。
 
-### 7.1 查询课表
+### 8.1 查询课表
 
 工具名：`schedule.query`
 
@@ -426,15 +514,15 @@ MVP 阶段课表优先存储在本地，因此以下接口作为本地 Repositor
 }
 ```
 
-### 7.2 新增/编辑/删除课程 P1
+### 8.2 新增/编辑/删除课程 P1
 
 `schedule.create`、`schedule.update`、`schedule.delete` 为 P1，不作为 MVP P0 阻塞项。删除课程等破坏性本地操作应复用 PendingAction 或提供撤销。
 
-## 8. Agent 会话接口
+## 9. Agent 会话接口
 
 如果 Agent 逻辑部署在服务端，可使用以下接口。若 Agent 全部在 Flutter 端编排，该协议可作为内部 DTO。
 
-### 8.1 发送消息
+### 9.1 发送消息
 
 ```http
 POST /agent/messages
@@ -465,6 +553,8 @@ POST /agent/messages
   "message": "success",
   "data": {
     "assistantMessage": "我会先检查校园卡状态，并在你确认后执行挂失。",
+    "runId": "run_20260707_001",
+    "runStatus": "suspended_for_confirmation",
     "phase": "respond",
     "toolCalls": [
       {
@@ -482,63 +572,80 @@ POST /agent/messages
 }
 ```
 
-### 8.2 流式消息事件
+### 9.2 流式消息事件
 
 可使用 SSE 或 WebSocket。MVP 可优先使用内部事件流；若服务端部署，可使用 SSE。
 
-事件示例：
+事件包必须包含 `runId`、递增 `sequence` 和 `terminal` 字段。`pending_action_created` 是暂停点，终止当前前半段流；用户确认后必须通过 `/agent/runs/{runId}/resume` 或内部 `resume(runId, pendingActionId)` 开启后半段事件流。
+
+前半段事件示例：
 
 ```text
 event: agent_phase
-data: {"phase":"observe","traceId":"trace_001"}
+data: {"runId":"run_20260707_001","sequence":1,"phase":"observe","traceId":"trace_001","terminal":false}
 
 event: agent_phase
-data: {"phase":"plan","intent":"campus_card_report_loss","steps":["campus_card.get_status","campus_card.report_loss","knowledge.search"]}
+data: {"runId":"run_20260707_001","sequence":2,"phase":"plan","intent":"campus_card_report_loss","steps":["campus_card.get_status","campus_card.report_loss","knowledge.search"],"terminal":false}
 
 event: safety_gate_decision
-data: {"toolName":"campus_card.get_status","decision":"allow"}
+data: {"runId":"run_20260707_001","sequence":3,"toolName":"campus_card.get_status","decision":"allow","terminal":false}
 
 event: tool_call_started
-data: {"toolCallId":"tool_001","toolName":"campus_card.get_status","status":"running"}
+data: {"runId":"run_20260707_001","sequence":4,"toolCallId":"tool_001","toolName":"campus_card.get_status","status":"running","terminal":false}
 
 event: tool_call_finished
-data: {"toolCallId":"tool_001","toolName":"campus_card.get_status","status":"success"}
+data: {"runId":"run_20260707_001","sequence":5,"toolCallId":"tool_001","toolName":"campus_card.get_status","status":"success","terminal":false}
 
 event: pending_action_created
-data: {"pendingActionId":"pa_20260707_001","toolName":"campus_card.report_loss","riskLevel":"high","expiresAt":"2026-07-07T10:10:00+08:00"}
-
-event: pending_action_confirmed
-data: {"pendingActionId":"pa_20260707_001","status":"confirmed"}
-
-event: tool_call_verified
-data: {"toolCallId":"tool_002","toolName":"campus_card.report_loss","verificationResult":"status_lost"}
-
-event: evidence_selected
-data: {"knowledgeId":"kb_card_replace_001","score":0.91,"source":"demo_knowledge_base","trustLevel":"demo"}
-
-event: message_delta
-data: {"delta":"已为演示账号完成校园卡挂失"}
-
-event: message_done
-data: {"messageId":"msg_002"}
+data: {"runId":"run_20260707_001","sequence":6,"pendingActionId":"pa_20260707_001","toolName":"campus_card.report_loss","riskLevel":"high","expiresAt":"2026-07-07T10:10:00+08:00","runStatus":"suspended_for_confirmation","terminal":true}
 ```
 
-### 8.3 Debug Trace 事件
+后半段 resume 事件示例：
 
-Trace 只展示脱敏阶段级事实。
+```text
+event: run_resumed
+data: {"runId":"run_20260707_001","sequence":7,"pendingActionId":"pa_20260707_001","status":"resumed","terminal":false}
+
+event: tool_call_started
+data: {"runId":"run_20260707_001","sequence":8,"toolCallId":"tool_002","toolName":"campus_card.report_loss","status":"running","terminal":false}
+
+event: tool_call_finished
+data: {"runId":"run_20260707_001","sequence":9,"toolCallId":"tool_002","toolName":"campus_card.report_loss","status":"success","terminal":false}
+
+event: tool_call_verified
+data: {"runId":"run_20260707_001","sequence":10,"toolCallId":"tool_002","toolName":"campus_card.report_loss","verificationResult":"status_lost","terminal":false}
+
+event: evidence_selected
+data: {"runId":"run_20260707_001","sequence":11,"knowledgeId":"kb_card_replace_001","score":0.91,"source":"demo_knowledge_base","trustLevel":"demo","terminal":false}
+
+event: message_delta
+data: {"runId":"run_20260707_001","sequence":12,"delta":"已为演示账号完成校园卡挂失","terminal":false}
+
+event: message_done
+data: {"runId":"run_20260707_001","sequence":13,"messageId":"msg_002","runStatus":"completed","terminal":true}
+```
+
+### 9.3 Debug Trace 事件
+
+Trace 只展示脱敏阶段级事实。Trace 事件必须来自 Agent Orchestrator 或测试注入的 Orchestrator Mock，UI 不允许生成 Trace。
 
 ```json
 {
   "traceId": "trace_001",
+  "runId": "run_20260707_001",
   "events": [
     {
+      "sequence": 2,
       "phase": "plan",
       "intent": "campus_card_report_loss",
       "toolName": "campus_card.report_loss",
       "safetyDecision": "require_confirmation",
+      "stateBefore": "running",
+      "stateAfter": "suspended_for_confirmation",
       "durationMs": 120
     },
     {
+      "sequence": 10,
       "phase": "verify",
       "toolName": "knowledge.search",
       "evidenceIds": ["kb_card_replace_001"],
@@ -552,7 +659,7 @@ Trace 只展示脱敏阶段级事实。
 
 禁止在 Trace 中输出系统 Prompt、隐藏推理链、Token、完整学号、完整卡号、完整工具请求体。
 
-## 9. 埋点接口 P1
+## 10. 埋点接口 P1
 
 ```http
 POST /events
@@ -578,13 +685,14 @@ POST /events
 2. 用户输入内容默认不上传；如需上传应先脱敏并获得授权。
 3. API 错误日志只记录错误码、接口名、耗时和请求 ID。
 
-## 10. 接口验收标准
+## 11. 接口验收标准
 
 1. 所有接口成功和失败都使用统一响应格式。
 2. P0 工具协议覆盖 `schedule.query`、`campus_card.get_status`、`campus_card.report_loss`、`knowledge.search`。
-3. 校园卡挂失接口必须校验 `pendingActionId` 与 `confirmationId`。
+3. 校园卡挂失接口必须校验 `pendingActionId`、`confirmationId` 与 `frozenParamsHash`。
 4. Mock 数据能覆盖饭卡挂失、课表查询、图书馆时间、补办流程。
 5. 前端能根据错误码展示明确错误提示。
-6. RAG 响应必须包含 `knowledgeId`、`source`、`updatedAt`、`trustLevel`、`score`。
-7. 流式事件能表达 Agent 阶段、Safety Gate 决策、PendingAction、工具调用、Verify 和最终回复。
-8. Debug Trace 完全脱敏，不包含隐藏推理链或敏感明文。
+6. RAG 响应必须包含 `knowledgeId`、`source`、`updatedAt`、`trustLevel`、`score`，并说明 `score` 是相关性分数。
+7. 流式事件能表达 Agent 阶段、Safety Gate 决策、PendingAction、工具调用、Verify 和最终回复，并包含 `runId`、递增 `sequence`、`terminal`。
+8. 需要确认的 Run 必须先暂停，再通过 `resume` 开启后半段执行。
+9. Debug Trace 完全脱敏，不包含隐藏推理链或敏感明文，且不得由 UI 自行生成。
