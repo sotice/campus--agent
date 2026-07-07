@@ -188,33 +188,22 @@ POST /agent/pending-actions
 }
 ```
 
-### 4.2 确认 PendingAction
+### 4.2 PendingAction 确认入口
+
+用户点击确认时，不再调用独立的 PendingAction confirm 接口。唯一确认入口统一为：
 
 ```http
-POST /agent/pending-actions/{pendingActionId}/confirm
-```
-
-响应：
-
-```json
-{
-  "success": true,
-  "code": "OK",
-  "message": "confirmed",
-  "data": {
-    "pendingActionId": "pa_20260707_001",
-    "confirmationId": "confirm_20260707_001",
-    "status": "confirmed"
-  }
-}
+POST /agent/runs/{runId}/resume
 ```
 
 规则：
 
-1. `confirmationId` 一次性使用。
-2. `confirmationId` 仅对同一 `pendingActionId`、同一 `toolName`、同一 `frozenParamsHash` 有效。
-3. 过期、取消、已执行的 PendingAction 不得确认。
-4. `frozenParamsSummary` 只用于 UI 展示，Safety Gate 必须使用规范化参数哈希校验。
+1. 前端只提交 `runId` 与 `pendingActionId`，不提交 `confirmationId`。
+2. `resume` 内部校验 Run 状态、PendingAction 状态、过期时间和 `frozenParamsHash`。
+3. 校验通过后，Agent Orchestrator 内部签发一次性 `confirmationId`，并只在后半段敏感工具调用中使用。
+4. `confirmationId` 不作为前端必须持有或传递的凭证，避免形成两套确认协议。
+5. 过期、取消、已执行的 PendingAction 不得 resume。
+6. `frozenParamsSummary` 只用于 UI 展示，Safety Gate 必须使用规范化参数哈希校验。
 
 ### 4.3 取消 PendingAction
 
@@ -307,7 +296,7 @@ POST /agent/runs/{runId}/resume
 规则：
 
 1. `resume` 只能用于 `suspended_for_confirmation` 状态的 Run。
-2. `resume` 必须校验 PendingAction 状态、过期时间、`frozenParamsHash` 和一次性确认凭证。
+2. `resume` 必须校验 PendingAction 状态、过期时间和 `frozenParamsHash`，校验通过后内部签发一次性 `confirmationId`。
 3. `resume` 后只能执行原计划中被冻结的后半段，不得重新让模型改写敏感工具参数。
 4. `resume` 失败时不得执行敏感工具。
 
@@ -533,7 +522,7 @@ POST /agent/messages
 ```json
 {
   "sessionId": "session_001",
-  "message": "饭卡丢了，帮我挂失",
+  "message": "校园卡丢了，帮我挂失",
   "inputType": "text",
   "clientContext": {
     "timezone": "Asia/Shanghai",
@@ -690,7 +679,7 @@ POST /events
 1. 所有接口成功和失败都使用统一响应格式。
 2. P0 工具协议覆盖 `schedule.query`、`campus_card.get_status`、`campus_card.report_loss`、`knowledge.search`。
 3. 校园卡挂失接口必须校验 `pendingActionId`、`confirmationId` 与 `frozenParamsHash`。
-4. Mock 数据能覆盖饭卡挂失、课表查询、图书馆时间、补办流程。
+4. Mock 数据能覆盖校园卡挂失、课表查询、图书馆时间、补办流程。
 5. 前端能根据错误码展示明确错误提示。
 6. RAG 响应必须包含 `knowledgeId`、`source`、`updatedAt`、`trustLevel`、`score`，并说明 `score` 是相关性分数。
 7. 流式事件能表达 Agent 阶段、Safety Gate 决策、PendingAction、工具调用、Verify 和最终回复，并包含 `runId`、递增 `sequence`、`terminal`。
